@@ -1,17 +1,23 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { authenticateRequest, ApiError } from './auth'
+import { handleCapabilityMetadata } from './capabilities'
 import { fetchJwks, loadAuthorization } from './supabase'
-import type { AppDeps, WorkerEnv } from './types'
+import type { AppDeps, AuthSecurityEvent, WorkerEnv } from './types'
 
 type HonoEnv = {
   Bindings: WorkerEnv
+}
+
+function recordSecurityEvent(event: AuthSecurityEvent): void {
+  console.info(JSON.stringify(event))
 }
 
 export function createApp(overrides: Partial<AppDeps> = {}) {
   const deps: AppDeps = {
     fetchJwks,
     loadAuthorization,
+    recordSecurityEvent,
     ...overrides,
   }
   const app = new Hono<HonoEnv>()
@@ -24,6 +30,8 @@ export function createApp(overrides: Partial<AppDeps> = {}) {
       allowMethods: ['GET', 'OPTIONS'],
     })
   )
+
+  app.get('/.well-known/oauth-protected-resource', handleCapabilityMetadata)
 
   app.get('/health', (c) =>
     c.json({

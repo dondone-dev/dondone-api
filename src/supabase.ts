@@ -16,6 +16,7 @@ export interface UserPermissionGroupRow {
   expires_at: string | null
   permission_groups: {
     key: string
+    status: 'active' | 'disabled'
     permission_group_permissions: Array<{
       permissions: {
         key: string
@@ -39,28 +40,35 @@ export async function loadAuthorization(
   const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false },
   })
-  const { data: profile } = await supabase
+  const { data: profile, error: profileError } = await supabase
     .from('profiles')
     .select('status')
     .eq('id', userId)
     .maybeSingle<ProfileRow>()
 
-  const { data: permissionRows } = await supabase
+  if (profileError) throw new Error(`Profile query failed: ${profileError.message}`)
+  if (!profile) return { status: 'disabled', permissions: [] }
+
+  const { data: permissionRows, error: permError } = await supabase
     .from('user_permissions')
     .select('permission_key,status,expires_at')
     .eq('user_id', userId)
     .returns<UserPermissionRow[]>()
 
-  const { data: groupRows } = await supabase
+  if (permError) throw new Error(`Permission query failed: ${permError.message}`)
+
+  const { data: groupRows, error: groupError } = await supabase
     .from('user_permission_groups')
     .select(
-      'status,expires_at,permission_groups(key,permission_group_permissions(permissions(key)))'
+      'status,expires_at,permission_groups(key,status,permission_group_permissions(permissions(key)))'
     )
     .eq('user_id', userId)
     .returns<UserPermissionGroupRow[]>()
 
+  if (groupError) throw new Error(`Permission group query failed: ${groupError.message}`)
+
   return {
-    status: profile?.status === 'disabled' ? 'disabled' : 'active',
+    status: profile.status === 'disabled' ? 'disabled' : 'active',
     permissions: buildEffectivePermissions({
       direct: permissionRows ?? [],
       groups: groupRows ?? [],
@@ -91,6 +99,7 @@ function activeGroupPermissions(rows: UserPermissionGroupRow[]): string[] {
   return rows
     .filter((row) => row.status === 'active')
     .filter((row) => !row.expires_at || Date.parse(row.expires_at) > now)
+    .filter((row) => row.permission_groups?.status === 'active')
     .flatMap((row) =>
       row.permission_groups?.permission_group_permissions
         .map((entry) => entry.permissions?.key)

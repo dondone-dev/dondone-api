@@ -1,6 +1,6 @@
 import { exportJWK, importJWK, SignJWT } from 'jose'
 import type { JWK } from 'jose'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { createApp } from './index'
 import type { AppDeps, WorkerEnv } from './types'
 
@@ -38,6 +38,53 @@ async function signer() {
         .setIssuedAt()
         .setExpirationTime('15m')
         .sign(key),
+    signAccessToken: (sub = 'user-123', email = 'user@example.com') =>
+      new SignJWT({ email, client_id: 'time', scope: 'api:echo' })
+        .setProtectedHeader({ alg: 'ES256', kid: 'test-key', typ: 'at+jwt' })
+        .setIssuer(env.AUTH_ISSUER)
+        .setAudience(env.AUTH_AUDIENCE)
+        .setSubject(sub)
+        .setIssuedAt()
+        .setExpirationTime('15m')
+        .sign(key),
+    signWrongAudience: (sub = 'user-123') =>
+      new SignJWT({ client_id: 'time', scope: 'api:echo' })
+        .setProtectedHeader({ alg: 'ES256', kid: 'test-key', typ: 'at+jwt' })
+        .setIssuer(env.AUTH_ISSUER)
+        .setAudience('https://other.dondone.dev')
+        .setSubject(sub)
+        .setIssuedAt()
+        .setExpirationTime('15m')
+        .sign(key),
+    signResourceToken: ({
+      audience = env.AUTH_AUDIENCE,
+      kid = 'test-key',
+      scope = 'api:echo',
+      typ = 'at+jwt',
+    }: {
+      audience?: string | string[]
+      kid?: string | null
+      scope?: string
+      typ?: string | null
+    } = {}) => {
+      const jwt = new SignJWT({
+        email: 'user@example.com',
+        client_id: 'time',
+        scope,
+      })
+      jwt.setProtectedHeader({
+        alg: 'ES256',
+        ...(kid === null ? {} : { kid }),
+        ...(typ === null ? {} : { typ }),
+      })
+      jwt
+        .setIssuer(env.AUTH_ISSUER)
+        .setAudience(audience)
+        .setSubject('user-123')
+        .setIssuedAt()
+        .setExpirationTime('15m')
+      return jwt.sign(key)
+    },
   }
 }
 
@@ -48,6 +95,7 @@ function deps(overrides: Partial<AppDeps> = {}): AppDeps {
       status: 'active',
       permissions: ['api:echo'],
     }),
+    recordSecurityEvent: () => undefined,
     ...overrides,
   }
 }
@@ -109,7 +157,7 @@ describe('dondone-api', () => {
         fetchJwks: async () => testSigner.jwks,
         loadAuthorization: async () => ({
           status: 'active',
-          permissions: ['api:echo', 'tier:vip'],
+          permissions: ['api:echo', 'api:tier:vip'],
         }),
       })
     ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
@@ -120,7 +168,7 @@ describe('dondone-api', () => {
       permissions: string[]
     }
     expect(body.user.tier).toBe('vip')
-    expect(body.permissions).toEqual(['api:echo', 'tier:vip'])
+    expect(body.permissions).toEqual(['api:echo', 'api:tier:vip'])
   })
 
   it('treats expired or revoked VIP permission as normal', async () => {
@@ -173,5 +221,224 @@ describe('dondone-api', () => {
 
     expect(response.status).toBe(403)
     expect(await response.json()).toEqual({ error: 'user_disabled' })
+  })
+
+  it('accepts at+jwt tokens in resource mode', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.signAccessToken()
+    const resourceEnv = { ...env, RESOURCE_ACCESS_TOKENS_ENABLED: 'true' }
+    const response = await createApp(
+      deps({ fetchJwks: async () => testSigner.jwks })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, resourceEnv)
+
+    expect(response.status).toBe(200)
+  })
+
+  it('rejects an at+jwt without the required api:echo scope in resource mode', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.signResourceToken({ scope: '' })
+    const resourceEnv = { ...env, RESOURCE_ACCESS_TOKENS_ENABLED: 'true' }
+    const response = await createApp(
+      deps({ fetchJwks: async () => testSigner.jwks })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, resourceEnv)
+
+    expect(response.status).toBe(403)
+    expect(await response.json()).toEqual({ error: 'insufficient_scope' })
+  })
+
+  it('rejects an at+jwt with the wrong scope in resource mode', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.signResourceToken({ scope: 'api:tier:vip' })
+    const resourceEnv = { ...env, RESOURCE_ACCESS_TOKENS_ENABLED: 'true' }
+    const response = await createApp(
+      deps({ fetchJwks: async () => testSigner.jwks })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, resourceEnv)
+
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual({ error: 'invalid_token' })
+  })
+
+  it('rejects every token when any scope is absent from the manifest allow-list', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.signResourceToken({ scope: 'api:echo api:unknown' })
+    const resourceEnv = { ...env, RESOURCE_ACCESS_TOKENS_ENABLED: 'true' }
+    const response = await createApp(
+      deps({ fetchJwks: async () => testSigner.jwks })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, resourceEnv)
+
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual({ error: 'invalid_token' })
+  })
+
+  it('requires both token scope and the current live grant', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.signResourceToken({ scope: 'api:echo' })
+    const resourceEnv = { ...env, RESOURCE_ACCESS_TOKENS_ENABLED: 'true' }
+    const response = await createApp(
+      deps({
+        fetchJwks: async () => testSigner.jwks,
+        loadAuthorization: async () => ({ status: 'active', permissions: [] }),
+      })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, resourceEnv)
+
+    expect(response.status).toBe(403)
+    expect(await response.json()).toEqual({ error: 'permission_denied' })
+  })
+
+  it('rejects legacy JWT typ when resource tokens are enabled', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.sign()
+    const resourceEnv = { ...env, RESOURCE_ACCESS_TOKENS_ENABLED: 'true' }
+    const response = await createApp(
+      deps({ fetchJwks: async () => testSigner.jwks })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, resourceEnv)
+
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual({ error: 'invalid_token' })
+  })
+
+  it('rejects token with wrong audience', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.signWrongAudience()
+    const response = await createApp(
+      deps({ fetchJwks: async () => testSigner.jwks })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
+
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual({ error: 'invalid_token' })
+  })
+
+  it('rejects a multi-audience token even when the API resource is included', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.signResourceToken({
+      audience: [env.AUTH_AUDIENCE, 'https://ai.dondone.dev'],
+    })
+    const resourceEnv = { ...env, RESOURCE_ACCESS_TOKENS_ENABLED: 'true' }
+    const response = await createApp(
+      deps({ fetchJwks: async () => testSigner.jwks })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, resourceEnv)
+
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual({ error: 'invalid_token' })
+  })
+
+  it('rejects a token without kid', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.signResourceToken({ kid: null })
+    const response = await createApp(
+      deps({ fetchJwks: async () => testSigner.jwks })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
+
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual({ error: 'invalid_token' })
+  })
+
+  it('rejects an empty kid before fetching JWKS', async () => {
+    const testSigner = await signer()
+    const fetchJwks = vi.fn(async () => testSigner.jwks)
+    const token = await testSigner.signResourceToken({ kid: '' })
+    const response = await createApp(deps({ fetchJwks })).request(
+      '/echo',
+      { headers: { Authorization: `Bearer ${token}` } },
+      env
+    )
+
+    expect(response.status).toBe(401)
+    expect(fetchJwks).not.toHaveBeenCalled()
+  })
+
+  it('rejects a kid that does not exactly match a published key', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.signResourceToken({ kid: 'test-key ' })
+    const response = await createApp(
+      deps({ fetchJwks: async () => testSigner.jwks })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
+
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual({ error: 'invalid_token' })
+  })
+
+  it('rejects an unsupported signing algorithm before fetching JWKS', async () => {
+    const fetchJwks = vi.fn(async () => ({ keys: [] }))
+    const token = await new SignJWT({ scope: 'api:echo' })
+      .setProtectedHeader({ alg: 'HS256', kid: 'test-key', typ: 'at+jwt' })
+      .setIssuer(env.AUTH_ISSUER)
+      .setAudience(env.AUTH_AUDIENCE)
+      .setSubject('user-123')
+      .setExpirationTime('15m')
+      .sign(new TextEncoder().encode('01234567890123456789012345678901'))
+
+    const response = await createApp(deps({ fetchJwks })).request(
+      '/echo',
+      { headers: { Authorization: `Bearer ${token}` } },
+      env
+    )
+
+    expect(response.status).toBe(401)
+    expect(fetchJwks).not.toHaveBeenCalled()
+  })
+
+  it('rejects the wrong token type in resource mode', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.signResourceToken({ typ: 'JWT' })
+    const resourceEnv = { ...env, RESOURCE_ACCESS_TOKENS_ENABLED: 'true' }
+    const response = await createApp(
+      deps({ fetchJwks: async () => testSigner.jwks })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, resourceEnv)
+
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual({ error: 'invalid_token' })
+  })
+
+  it('rejects a token without typ even when resource mode is disabled', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.signResourceToken({ typ: null })
+    const response = await createApp(
+      deps({ fetchJwks: async () => testSigner.jwks })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
+
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual({ error: 'invalid_token' })
+  })
+
+  it('rejects an unknown typ even when resource mode is disabled', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.signResourceToken({ typ: 'application/jwt' })
+    const response = await createApp(
+      deps({ fetchJwks: async () => testSigner.jwks })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
+
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual({ error: 'invalid_token' })
+  })
+
+  it('returns 500 when loadAuthorization throws (fail-closed)', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.sign()
+    const response = await createApp(
+      deps({
+        fetchJwks: async () => testSigner.jwks,
+        loadAuthorization: async () => { throw new Error('Supabase unavailable') },
+      })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
+
+    expect(response.status).toBe(500)
+    expect(await response.json()).toEqual({ error: 'internal_error' })
+  })
+
+  it('accepts and records legacy token use when resource tokens are disabled', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.sign()
+    const recordSecurityEvent = vi.fn()
+    const response = await createApp(
+      deps({ fetchJwks: async () => testSigner.jwks, recordSecurityEvent })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
+
+    expect(response.status).toBe(200)
+    expect(recordSecurityEvent).toHaveBeenCalledWith({
+      event: 'legacy_access_token_accepted',
+      resource: env.AUTH_AUDIENCE,
+      userId: 'user-123',
+    })
   })
 })

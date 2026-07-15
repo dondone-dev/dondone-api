@@ -9,12 +9,13 @@
 | 端点 | 说明 |
 |---|---|
 | `GET /health` | 返回服务健康状态。 |
-| `GET /echo` | 验证 Dondone API JWT，并返回用户 tier 与 permissions。 |
+| `GET /echo` | 验证 Dondone access token，并返回用户 tier 与 permissions。 |
+| `GET /.well-known/oauth-protected-resource` | 发布 RFC 9728 资源元数据、OAuth scopes 与服务能力目录，缓存 5 分钟。 |
 
 `/echo` 需要：
 
 ```http
-Authorization: Bearer <Dondone API JWT>
+Authorization: Bearer <Dondone access token>
 ```
 
 ## 环境变量
@@ -27,9 +28,16 @@ AUTH_AUDIENCE=https://api.dondone.dev
 AUTH_JWKS_URL=https://auth.dondone.dev/api/jwks
 SUPABASE_URL=<supabase-project-url>
 SUPABASE_SERVICE_ROLE_KEY=<secret>
+RESOURCE_ACCESS_TOKENS_ENABLED=false
 ```
 
 `SUPABASE_SERVICE_ROLE_KEY` 必须作为 secret 配置，不能提交到仓库。
+
+`RESOURCE_ACCESS_TOKENS_ENABLED` 是发布开关，已在 `wrangler.toml` 中显式设为 `"false"`。资源模式（`"true"`）下，`/echo` 只接受 ES256 `at+jwt`：header 必须有非空且匹配的 `kid`，`aud` 必须是单一字符串并精确等于 `AUTH_AUDIENCE`，scope 必须包含 `api:echo`，且 token 中每个 scope 都必须在当前 well-known manifest 的 `scopes_supported` 中。scope 只是请求能力上限；服务每次请求仍会读取 Supabase 当前 grant，撤销后立即拒绝。
+
+开关为 `"false"` 时处于双读迁移期，仍接受旧 `typ=JWT` token。每个成功授权的旧 token 请求会输出一条结构化 JSON 日志：`event=legacy_access_token_accepted`，并包含 resource 与 user ID。应在 Worker 日志中统计该事件：先在 `dondone-auth` 开启资源 token 签发并迁移客户端；连续一个 token 最大有效期再加部署缓冲时间都为零后，才开启 API 的资源模式。
+
+公开的 `GET /.well-known/oauth-protected-resource` 是随服务版本发布的 RFC 9728 元数据。`scopes_supported` 只列 OAuth scope；`dondone_capabilities.permissions` 还可声明 `api:tier:vip` 这类实时策略权限，它不会写入 token scope。
 
 从 Supabase Dashboard 获取 service role key：
 
