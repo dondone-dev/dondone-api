@@ -3,21 +3,16 @@ import { cors } from 'hono/cors'
 import { authenticateRequest, ApiError } from './auth'
 import { handleCapabilityMetadata } from './capabilities'
 import { fetchJwks, loadAuthorization } from './supabase'
-import type { AppDeps, AuthSecurityEvent, WorkerEnv } from './types'
+import type { AppDeps, WorkerEnv } from './types'
 
 type HonoEnv = {
   Bindings: WorkerEnv
-}
-
-function recordSecurityEvent(event: AuthSecurityEvent): void {
-  console.info(JSON.stringify(event))
 }
 
 export function createApp(overrides: Partial<AppDeps> = {}) {
   const deps: AppDeps = {
     fetchJwks,
     loadAuthorization,
-    recordSecurityEvent,
     ...overrides,
   }
   const app = new Hono<HonoEnv>()

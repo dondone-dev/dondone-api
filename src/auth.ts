@@ -19,7 +19,6 @@ export class ApiError extends Error {
 interface VerifiedToken {
   userId: string
   email?: string
-  tokenType: 'at+jwt' | 'JWT'
   scopes: string[]
 }
 
@@ -36,17 +35,11 @@ export async function authenticateRequest(
 
   const verified = await verifyDondoneToken(token, env, deps)
 
-  if (isResourceTokensEnabled(env) && verified.tokenType !== 'at+jwt') {
+  if (verified.scopes.some((scope) => !OAUTH_SCOPE_ALLOW_LIST.has(scope))) {
     throw new ApiError(401, 'invalid_token')
   }
-
-  if (isResourceTokensEnabled(env)) {
-    if (verified.scopes.some((scope) => !OAUTH_SCOPE_ALLOW_LIST.has(scope))) {
-      throw new ApiError(401, 'invalid_token')
-    }
-    if (!verified.scopes.includes(REQUIRED_ECHO_SCOPE)) {
-      throw new ApiError(403, 'insufficient_scope')
-    }
+  if (!verified.scopes.includes(REQUIRED_ECHO_SCOPE)) {
+    throw new ApiError(403, 'insufficient_scope')
   }
 
   const authorizationRecord = await deps.loadAuthorization(env, verified.userId)
@@ -55,14 +48,6 @@ export async function authenticateRequest(
   }
   if (!authorizationRecord.permissions.includes('api:echo')) {
     throw new ApiError(403, 'permission_denied')
-  }
-
-  if (!isResourceTokensEnabled(env) && verified.tokenType === 'JWT') {
-    deps.recordSecurityEvent({
-      event: 'legacy_access_token_accepted',
-      resource: env.AUTH_AUDIENCE,
-      userId: verified.userId,
-    })
   }
 
   const tier = authorizationRecord.permissions.includes('api:tier:vip')
@@ -75,10 +60,6 @@ export async function authenticateRequest(
     permissions: authorizationRecord.permissions,
     tier,
   }
-}
-
-function isResourceTokensEnabled(env: WorkerEnv): boolean {
-  return env.RESOURCE_ACCESS_TOKENS_ENABLED === 'true'
 }
 
 async function verifyDondoneToken(
@@ -95,7 +76,7 @@ async function verifyDondoneToken(
     if (typeof header.kid !== 'string' || header.kid.length === 0) {
       throw new Error('Missing key identifier.')
     }
-    if (header.typ !== 'JWT' && header.typ !== 'at+jwt') {
+    if (header.typ !== 'at+jwt') {
       throw new Error('Unsupported token type.')
     }
 
@@ -122,7 +103,6 @@ async function verifyDondoneToken(
       throw new Error('Missing subject.')
     }
 
-    const tokenType = header.typ
     const scopeClaim = verified.payload.scope
     const scopes = typeof scopeClaim === 'string' ? scopeClaim.split(' ').filter(Boolean) : []
 
@@ -132,7 +112,6 @@ async function verifyDondoneToken(
         typeof verified.payload.email === 'string'
           ? verified.payload.email
           : undefined,
-      tokenType,
       scopes,
     }
   } catch {
