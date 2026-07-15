@@ -5,12 +5,6 @@ interface ProfileRow {
   status: 'active' | 'disabled' | null
 }
 
-interface UserPermissionRow {
-  permission_key: string
-  status: 'active' | 'revoked'
-  expires_at: string | null
-}
-
 export interface UserPermissionGroupRow {
   status: 'active' | 'revoked'
   expires_at: string | null
@@ -49,14 +43,6 @@ export async function loadAuthorization(
   if (profileError) throw new Error(`Profile query failed: ${profileError.message}`)
   if (!profile) return { status: 'disabled', permissions: [] }
 
-  const { data: permissionRows, error: permError } = await supabase
-    .from('user_permissions')
-    .select('permission_key,status,expires_at')
-    .eq('user_id', userId)
-    .returns<UserPermissionRow[]>()
-
-  if (permError) throw new Error(`Permission query failed: ${permError.message}`)
-
   const { data: groupRows, error: groupError } = await supabase
     .from('user_permission_groups')
     .select(
@@ -70,28 +56,16 @@ export async function loadAuthorization(
   return {
     status: profile.status === 'disabled' ? 'disabled' : 'active',
     permissions: buildEffectivePermissions({
-      direct: permissionRows ?? [],
       groups: groupRows ?? [],
     }),
   }
 }
 
 export function buildEffectivePermissions(input: {
-  direct: UserPermissionRow[]
   groups: UserPermissionGroupRow[]
 }): string[] {
-  const direct = activeDirectPermissions(input.direct)
   const grouped = activeGroupPermissions(input.groups)
-  return [...new Set([...direct, ...grouped])].sort()
-}
-
-function activeDirectPermissions(rows: UserPermissionRow[]): string[] {
-  const now = Date.now()
-  return rows
-    .filter((row) => row.status === 'active')
-    .filter((row) => !row.expires_at || Date.parse(row.expires_at) > now)
-    .map((row) => row.permission_key)
-    .sort()
+  return [...new Set(grouped)].sort()
 }
 
 function activeGroupPermissions(rows: UserPermissionGroupRow[]): string[] {

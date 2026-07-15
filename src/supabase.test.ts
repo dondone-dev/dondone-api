@@ -34,24 +34,23 @@ function queryResult(result: unknown, terminal: 'maybeSingle' | 'returns') {
 
 function mockAuthorizationQueries(results: {
   profile: unknown
-  direct?: unknown
   groups?: unknown
 }) {
+  const requestedTables: string[] = []
   const queries = {
     profiles: queryResult(results.profile, 'maybeSingle'),
-    user_permissions: queryResult(
-      results.direct ?? { data: [], error: null },
-      'returns'
-    ),
     user_permission_groups: queryResult(
       results.groups ?? { data: [], error: null },
       'returns'
     ),
   }
   createClientMock.mockReturnValue({
-    from: (table: keyof typeof queries) => queries[table],
+    from: (table: keyof typeof queries) => {
+      requestedTables.push(table)
+      return queries[table]
+    },
   })
-  return queries
+  return { queries, requestedTables }
 }
 
 beforeEach(() => {
@@ -59,12 +58,8 @@ beforeEach(() => {
 })
 
 describe('buildEffectivePermissions', () => {
-  it('combines active group grants with legacy direct grants', () => {
+  it('returns sorted unique permissions from active group grants only', () => {
     const permissions = buildEffectivePermissions({
-      direct: [
-        { permission_key: 'api:echo', status: 'active', expires_at: null },
-        { permission_key: 'legacy:expired', status: 'active', expires_at: past },
-      ],
       groups: [
         {
           status: 'active',
@@ -74,6 +69,7 @@ describe('buildEffectivePermissions', () => {
             status: 'active',
             permission_group_permissions: [
               { permissions: { key: 'api:tier:vip' } },
+              { permissions: { key: 'api:echo' } },
               { permissions: { key: 'api:echo' } },
             ],
           },
@@ -97,7 +93,6 @@ describe('buildEffectivePermissions', () => {
 
   it('ignores expired group grants', () => {
     const permissions = buildEffectivePermissions({
-      direct: [],
       groups: [
         {
           status: 'active',
@@ -129,7 +124,7 @@ describe('loadAuthorization fail-closed adapter', () => {
   })
 
   it('treats a missing profile as disabled without reading grants', async () => {
-    const queries = mockAuthorizationQueries({
+    const { queries } = mockAuthorizationQueries({
       profile: { data: null, error: null },
     })
 
@@ -137,19 +132,7 @@ describe('loadAuthorization fail-closed adapter', () => {
       status: 'disabled',
       permissions: [],
     })
-    expect(queries.user_permissions.select).not.toHaveBeenCalled()
     expect(queries.user_permission_groups.select).not.toHaveBeenCalled()
-  })
-
-  it('fails when the direct permission query errors', async () => {
-    mockAuthorizationQueries({
-      profile: { data: { status: 'active' }, error: null },
-      direct: { data: null, error: { message: 'direct unavailable' } },
-    })
-
-    await expect(loadAuthorization(env, 'user-123')).rejects.toThrow(
-      'Permission query failed: direct unavailable'
-    )
   })
 
   it('fails when the group permission query errors', async () => {
@@ -161,6 +144,16 @@ describe('loadAuthorization fail-closed adapter', () => {
     await expect(loadAuthorization(env, 'user-123')).rejects.toThrow(
       'Permission group query failed: groups unavailable'
     )
+  })
+
+  it('loads authorization without querying legacy direct grants', async () => {
+    const { requestedTables } = mockAuthorizationQueries({
+      profile: { data: { status: 'active' }, error: null },
+    })
+
+    await loadAuthorization(env, 'user-123')
+
+    expect(requestedTables).toEqual(['profiles', 'user_permission_groups'])
   })
 
   it('does not grant permissions from a disabled permission group', async () => {
