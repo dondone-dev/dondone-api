@@ -10,7 +10,6 @@
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.107.0",
     "hono": "^4.11.1",
     "jose": "^6.2.3"
   },

@@ -1,9 +1,9 @@
 name = "dondone-api"
 main = "src/index.ts"
-compatibility_date = "2026-07-03"
+compatibility_date = "2026-07-16"
 
 [vars]
 AUTH_ISSUER = "https://auth.dondone.dev"
 AUTH_AUDIENCE = "https://api.dondone.dev"
 AUTH_JWKS_URL = "https://auth.dondone.dev/api/jwks"
-SUPABASE_URL = "https://ttmrvhkmqljulrptviow.supabase.co"
+AUTH_USAGE_URL = "https://auth.dondone.dev"

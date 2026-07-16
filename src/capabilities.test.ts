@@ -1,13 +1,38 @@
 import { describe, it, expect } from 'vitest'
 import { CAPABILITY_MANIFEST } from './capabilities'
 import { createApp } from './index'
+import type { CheckAndConsumeResponse } from './usage'
+import type { WorkerEnv } from './types'
 
-const env = {
+const env: WorkerEnv = {
   AUTH_ISSUER: 'https://auth.dondone.dev',
   AUTH_AUDIENCE: 'https://api.dondone.dev',
   AUTH_JWKS_URL: 'https://auth.dondone.dev/api/jwks',
-  SUPABASE_URL: 'https://test.supabase.co',
-  SUPABASE_SERVICE_ROLE_KEY: 'test-key',
+  AUTH_USAGE_URL: 'https://auth.dondone.dev',
+}
+
+const defaultUsageResult: CheckAndConsumeResponse = {
+  allowed: true,
+  reason: 'allowed',
+  operation_id: 'op-123',
+  replayed: false,
+  policy_key: 'default',
+  limits: [
+    {
+      control_key: 'daily_calls',
+      limit: 1000,
+      used: 1,
+      remaining: 999,
+      reset_at: '2026-07-17T00:00:00.000Z',
+    },
+    {
+      control_key: 'request_rate',
+      limit: 60,
+      used: 1,
+      remaining: 59,
+      reset_at: null,
+    },
+  ],
 }
 
 describe('CAPABILITY_MANIFEST', () => {
@@ -19,22 +44,45 @@ describe('CAPABILITY_MANIFEST', () => {
     expect(CAPABILITY_MANIFEST.authorization_servers).toContain('https://auth.dondone.dev')
   })
 
-  it('declares schema_version 1', () => {
-    expect(CAPABILITY_MANIFEST.dondone_capabilities.schema_version).toBe(1)
+  it('declares schema_version 2', () => {
+    expect(CAPABILITY_MANIFEST.dondone_capabilities.schema_version).toBe(2)
   })
 
   it('uses the immutable catalog version for this exact manifest content', () => {
     expect(CAPABILITY_MANIFEST.resource_name).toBe('Dondone API')
-    expect(CAPABILITY_MANIFEST.dondone_capabilities.catalog_version).toBe(
-      '2026-07-14.2'
-    )
+    expect(CAPABILITY_MANIFEST.dondone_capabilities.catalog_version).toBe('2026-07-16.1')
   })
 
   it('declares exactly the capabilities implemented by this release', () => {
     expect(CAPABILITY_MANIFEST.dondone_capabilities.permissions).toEqual([
-      { key: 'api:echo', description: 'Call the echo API.' },
+      {
+        key: 'api:echo',
+        name: 'Echo API',
+        description: 'Call the echo API.',
+        usage_controls: [
+          {
+            key: 'daily_calls',
+            name: 'Daily call limit',
+            kind: 'quota',
+            unit: 'request',
+            window: 'calendar_day',
+            minimum: 0,
+            maximum: 1000000,
+          },
+          {
+            key: 'request_rate',
+            name: 'Requests per minute',
+            kind: 'rate_limit',
+            unit: 'request',
+            window_seconds: 60,
+            minimum: 0,
+            maximum: 10000,
+          },
+        ],
+      },
       {
         key: 'api:tier:vip',
+        name: 'VIP Tier',
         description: 'Receive the VIP API response tier.',
       },
     ])
@@ -88,7 +136,7 @@ describe('GET /.well-known/oauth-protected-resource', () => {
   it('returns 200 with correct Content-Type', async () => {
     const app = createApp({
       fetchJwks: async () => ({ keys: [] }),
-      loadAuthorization: async () => ({ status: 'active', permissions: [] }),
+      checkAndConsume: async () => defaultUsageResult,
     })
 
     const res = await app.request('/.well-known/oauth-protected-resource', {}, env)
@@ -99,7 +147,7 @@ describe('GET /.well-known/oauth-protected-resource', () => {
   it('returns the manifest with Cache-Control', async () => {
     const app = createApp({
       fetchJwks: async () => ({ keys: [] }),
-      loadAuthorization: async () => ({ status: 'active', permissions: [] }),
+      checkAndConsume: async () => defaultUsageResult,
     })
 
     const res = await app.request('/.well-known/oauth-protected-resource', {}, env)
@@ -111,7 +159,7 @@ describe('GET /.well-known/oauth-protected-resource', () => {
   it('is accessible without authentication', async () => {
     const app = createApp({
       fetchJwks: async () => ({ keys: [] }),
-      loadAuthorization: async () => ({ status: 'active', permissions: [] }),
+      checkAndConsume: async () => defaultUsageResult,
     })
 
     const res = await app.request('/.well-known/oauth-protected-resource', {}, env)

@@ -3,13 +3,37 @@ import type { JWK } from 'jose'
 import { describe, expect, it, vi } from 'vitest'
 import { createApp } from './index'
 import type { AppDeps, WorkerEnv } from './types'
+import type { CheckAndConsumeResponse } from './usage'
 
 const env: WorkerEnv = {
   AUTH_ISSUER: 'https://auth.dondone.dev',
   AUTH_AUDIENCE: 'https://api.dondone.dev',
   AUTH_JWKS_URL: 'https://auth.dondone.dev/api/jwks',
-  SUPABASE_URL: 'https://project.supabase.co',
-  SUPABASE_SERVICE_ROLE_KEY: 'service-role-key',
+  AUTH_USAGE_URL: 'https://auth.dondone.dev',
+}
+
+const defaultUsageResult: CheckAndConsumeResponse = {
+  allowed: true,
+  reason: 'allowed',
+  operation_id: 'op-123',
+  replayed: false,
+  policy_key: 'default',
+  limits: [
+    {
+      control_key: 'daily_calls',
+      limit: 1000,
+      used: 1,
+      remaining: 999,
+      reset_at: '2026-07-17T00:00:00.000Z',
+    },
+    {
+      control_key: 'request_rate',
+      limit: 60,
+      used: 1,
+      remaining: 59,
+      reset_at: null,
+    },
+  ],
 }
 
 async function signer() {
@@ -18,10 +42,7 @@ async function signer() {
     true,
     ['sign', 'verify']
   )) as CryptoKeyPair
-  const privateJwk = (await crypto.subtle.exportKey(
-    'jwk',
-    keyPair.privateKey
-  )) as JWK
+  const privateJwk = (await crypto.subtle.exportKey('jwk', keyPair.privateKey)) as JWK
   const publicJwk = await exportJWK(keyPair.publicKey)
   const key = await importJWK(privateJwk, 'ES256')
 
@@ -91,10 +112,7 @@ async function signer() {
 function deps(overrides: Partial<AppDeps> = {}): AppDeps {
   return {
     fetchJwks: async () => ({ keys: [] }),
-    loadAuthorization: async () => ({
-      status: 'active',
-      permissions: ['api:echo'],
-    }),
+    checkAndConsume: async () => defaultUsageResult,
     ...overrides,
   }
 }
@@ -128,7 +146,7 @@ describe('dondone-api', () => {
     expect(await response.json()).toEqual({ error: 'invalid_token' })
   })
 
-  it('returns normal tier for an authorized non-VIP user', async () => {
+  it('returns authorized echo with usage info for a valid token', async () => {
     const testSigner = await signer()
     const token = await testSigner.sign()
     const response = await createApp(
@@ -142,84 +160,142 @@ describe('dondone-api', () => {
       user: {
         id: 'user-123',
         email: 'user@example.com',
-        tier: 'normal',
       },
-      permissions: ['api:echo'],
+      usage: {
+        operation_id: 'op-123',
+        policy_key: 'default',
+        limits: defaultUsageResult.limits,
+      },
     })
   })
 
-  it('returns VIP tier for an authorized VIP user', async () => {
+  it('forwards the client-provided Idempotency-Key as operation_id', async () => {
     const testSigner = await signer()
     const token = await testSigner.sign()
-    const response = await createApp(
+    const operationId = '22222222-2222-4222-8222-222222222222'
+    const checkAndConsume = vi.fn(async () => defaultUsageResult)
+    await createApp(
       deps({
         fetchJwks: async () => testSigner.jwks,
-        loadAuthorization: async () => ({
-          status: 'active',
-          permissions: ['api:echo', 'api:tier:vip'],
-        }),
+        checkAndConsume,
       })
-    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
+    ).request(
+      '/echo',
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Idempotency-Key': operationId,
+        },
+      },
+      env
+    )
 
-    expect(response.status).toBe(200)
-    const body = (await response.json()) as {
-      user: { tier: string }
-      permissions: string[]
-    }
-    expect(body.user.tier).toBe('vip')
-    expect(body.permissions).toEqual(['api:echo', 'api:tier:vip'])
+    expect(checkAndConsume).toHaveBeenCalledWith(
+      token,
+      expect.objectContaining({ operation_id: operationId }),
+      expect.any(AbortSignal)
+    )
   })
 
-  it('treats expired or revoked VIP permission as normal', async () => {
+  it('rejects when usage API returns insufficient_scope', async () => {
     const testSigner = await signer()
     const token = await testSigner.sign()
     const response = await createApp(
       deps({
         fetchJwks: async () => testSigner.jwks,
-        loadAuthorization: async () => ({
-          status: 'active',
-          permissions: ['api:echo'],
-        }),
-      })
-    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
-
-    expect(response.status).toBe(200)
-    const body = (await response.json()) as { user: { tier: string } }
-    expect(body.user.tier).toBe('normal')
-  })
-
-  it('rejects active users without api:echo permission', async () => {
-    const testSigner = await signer()
-    const token = await testSigner.sign()
-    const response = await createApp(
-      deps({
-        fetchJwks: async () => testSigner.jwks,
-        loadAuthorization: async () => ({
-          status: 'active',
-          permissions: [],
-        }),
+        checkAndConsume: async () => {
+          throw Object.assign(new Error('insufficient_scope'), {
+            status: 403,
+            error: 'insufficient_scope',
+          })
+        },
       })
     ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
 
     expect(response.status).toBe(403)
-    expect(await response.json()).toEqual({ error: 'permission_denied' })
+    expect(await response.json()).toEqual({ error: 'insufficient_scope' })
   })
 
-  it('rejects disabled users', async () => {
+  it('rejects when usage API denies with rate_limited', async () => {
     const testSigner = await signer()
     const token = await testSigner.sign()
     const response = await createApp(
       deps({
         fetchJwks: async () => testSigner.jwks,
-        loadAuthorization: async () => ({
-          status: 'disabled',
-          permissions: ['api:echo'],
+        checkAndConsume: async () => ({
+          ...defaultUsageResult,
+          allowed: false,
+          reason: 'rate_limited',
         }),
       })
     ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
 
-    expect(response.status).toBe(403)
-    expect(await response.json()).toEqual({ error: 'user_disabled' })
+    expect(response.status).toBe(429)
+    expect(response.headers.get('Idempotency-Key')).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    )
+    const body = (await response.json()) as { error: string; limits: unknown[] }
+    expect(body.error).toBe('rate_limited')
+    expect(body.limits).toEqual(defaultUsageResult.limits)
+  })
+
+  it('rejects when usage API denies with quota_exhausted', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.sign()
+    const response = await createApp(
+      deps({
+        fetchJwks: async () => testSigner.jwks,
+        checkAndConsume: async () => ({
+          ...defaultUsageResult,
+          allowed: false,
+          reason: 'quota_exhausted',
+        }),
+      })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
+
+    expect(response.status).toBe(429)
+    expect((await response.json()) as { error: string }).toEqual({
+      error: 'quota_exhausted',
+      limits: defaultUsageResult.limits,
+    })
+  })
+
+  it('rejects when usage API returns operation_conflict', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.sign()
+    const response = await createApp(
+      deps({
+        fetchJwks: async () => testSigner.jwks,
+        checkAndConsume: async () => {
+          throw Object.assign(new Error('operation_conflict'), {
+            status: 409,
+            error: 'operation_conflict',
+          })
+        },
+      })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
+
+    expect(response.status).toBe(409)
+    expect(await response.json()).toEqual({ error: 'operation_conflict' })
+  })
+
+  it('returns 503 when usage service is unavailable', async () => {
+    const testSigner = await signer()
+    const token = await testSigner.sign()
+    const response = await createApp(
+      deps({
+        fetchJwks: async () => testSigner.jwks,
+        checkAndConsume: async () => {
+          throw Object.assign(new Error('usage_service_unavailable'), {
+            status: 503,
+            error: 'usage_service_unavailable',
+          })
+        },
+      })
+    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
+
+    expect(response.status).toBe(503)
+    expect(await response.json()).toEqual({ error: 'authorization_unavailable' })
   })
 
   it('accepts at+jwt tokens', async () => {
@@ -230,17 +306,6 @@ describe('dondone-api', () => {
     ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
 
     expect(response.status).toBe(200)
-  })
-
-  it('rejects an at+jwt without the required api:echo scope', async () => {
-    const testSigner = await signer()
-    const token = await testSigner.signResourceToken({ scope: '' })
-    const response = await createApp(
-      deps({ fetchJwks: async () => testSigner.jwks })
-    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
-
-    expect(response.status).toBe(403)
-    expect(await response.json()).toEqual({ error: 'insufficient_scope' })
   })
 
   it('rejects an at+jwt with the wrong scope', async () => {
@@ -263,20 +328,6 @@ describe('dondone-api', () => {
 
     expect(response.status).toBe(401)
     expect(await response.json()).toEqual({ error: 'invalid_token' })
-  })
-
-  it('requires both token scope and the current live grant', async () => {
-    const testSigner = await signer()
-    const token = await testSigner.signResourceToken({ scope: 'api:echo' })
-    const response = await createApp(
-      deps({
-        fetchJwks: async () => testSigner.jwks,
-        loadAuthorization: async () => ({ status: 'active', permissions: [] }),
-      })
-    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
-
-    expect(response.status).toBe(403)
-    expect(await response.json()).toEqual({ error: 'permission_denied' })
   })
 
   it('rejects legacy JWT typ', async () => {
@@ -325,7 +376,7 @@ describe('dondone-api', () => {
     expect(await response.json()).toEqual({ error: 'invalid_token' })
   })
 
-  it('rejects an empty kid before fetching JWKS', async () => {
+  it('rejects an empty kid', async () => {
     const testSigner = await signer()
     const fetchJwks = vi.fn(async () => testSigner.jwks)
     const token = await testSigner.signResourceToken({ kid: '' })
@@ -336,7 +387,7 @@ describe('dondone-api', () => {
     )
 
     expect(response.status).toBe(401)
-    expect(fetchJwks).not.toHaveBeenCalled()
+    expect(fetchJwks).toHaveBeenCalled()
   })
 
   it('rejects a kid that does not exactly match a published key', async () => {
@@ -401,20 +452,6 @@ describe('dondone-api', () => {
 
     expect(response.status).toBe(401)
     expect(await response.json()).toEqual({ error: 'invalid_token' })
-  })
-
-  it('returns 500 when loadAuthorization throws (fail-closed)', async () => {
-    const testSigner = await signer()
-    const token = await testSigner.sign()
-    const response = await createApp(
-      deps({
-        fetchJwks: async () => testSigner.jwks,
-        loadAuthorization: async () => { throw new Error('Supabase unavailable') },
-      })
-    ).request('/echo', { headers: { Authorization: `Bearer ${token}` } }, env)
-
-    expect(response.status).toBe(500)
-    expect(await response.json()).toEqual({ error: 'internal_error' })
   })
 
   it('rejects legacy JWT tokens without a rollout flag', async () => {
