@@ -20,41 +20,20 @@ Authorization: Bearer <Dondone access token>
 
 ## Environment
 
-Configure these in Cloudflare Workers:
+Runtime configuration is declared as public vars in `wrangler.toml`:
 
 ```sh
 AUTH_ISSUER=https://auth.dondone.dev
 AUTH_AUDIENCE=https://api.dondone.dev
 AUTH_JWKS_URL=https://auth.dondone.dev/api/jwks
-SUPABASE_URL=<supabase-project-url>
-SUPABASE_SERVICE_ROLE_KEY=<secret>
+AUTH_USAGE_URL=https://auth.dondone.dev
 ```
 
-`SUPABASE_SERVICE_ROLE_KEY` must be configured as a secret, not committed.
+This service does not access Supabase directly and requires no Supabase secret. Authorization — the permission grant plus usage-policy check — is delegated per request to the Dondone Auth usage endpoint at `AUTH_USAGE_URL`.
 
-`/echo` accepts only ES256 `at+jwt` tokens with a non-empty matching `kid`, a single `aud` exactly equal to `AUTH_AUDIENCE`, and the `api:echo` scope. Every token scope must be listed by this release's well-known manifest. The scope is only an upper bound: `/echo` also requires the current Supabase grant on every request. Legacy `typ=JWT` tokens are rejected.
+`/echo` accepts only ES256 `at+jwt` tokens with a non-empty matching `kid`, a single `aud` exactly equal to `AUTH_AUDIENCE`, and the `api:echo` scope. Every token scope must be listed by this release's well-known manifest. The scope is only an upper bound: `/echo` also re-checks the current permission grant on every request via the usage service. Legacy `typ=JWT` tokens are rejected.
 
 The public `GET /.well-known/oauth-protected-resource` endpoint is the release-owned RFC 9728 metadata document. `scopes_supported` contains OAuth request scopes; `dondone_capabilities.permissions` may additionally contain live policy permissions such as `api:tier:vip` that are deliberately not token scopes.
-
-Get the service role key from Supabase Dashboard:
-
-1. Open your Supabase project.
-2. Go to **Project Settings** → **API Keys**.
-3. In the API keys list, copy the key that has service role privileges. It usually starts with `sb_secret_...`.
-
-Supabase may show a `default` API key by default. Do not use the publishable/default client key for this service; `dondone-api` needs the service role secret key because it reads authorization tables on the server side.
-
-Set the service role key with Wrangler, then paste the value from Supabase:
-
-```sh
-pnpm wrangler secret put SUPABASE_SERVICE_ROLE_KEY
-```
-
-The value should be the Supabase service role secret key, for example:
-
-```sh
-echo "sb_secret_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" | pnpm wrangler secret put SUPABASE_SERVICE_ROLE_KEY
-```
 
 ## Development
 

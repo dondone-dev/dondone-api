@@ -2,7 +2,7 @@
 
 [English](./README.md)
 
-基于 Cloudflare Workers + Hono 的 Dondone API 服务，用于验证 Dondone API JWT、查询 Supabase 授权数据，并返回用户权限与 `normal`/`vip` 分层。
+基于 Cloudflare Workers + Hono 的 Dondone API 服务，用于验证 Dondone API JWT，并将授权（权限 grant 与用量策略）委托给 Dondone Auth 的 usage 端点校验。
 
 ## API
 
@@ -20,41 +20,20 @@ Authorization: Bearer <Dondone access token>
 
 ## 环境变量
 
-在 Cloudflare Workers 中配置：
+运行时配置以公开 vars 声明在 `wrangler.toml` 中：
 
 ```sh
 AUTH_ISSUER=https://auth.dondone.dev
 AUTH_AUDIENCE=https://api.dondone.dev
 AUTH_JWKS_URL=https://auth.dondone.dev/api/jwks
-SUPABASE_URL=<supabase-project-url>
-SUPABASE_SERVICE_ROLE_KEY=<secret>
+AUTH_USAGE_URL=https://auth.dondone.dev
 ```
 
-`SUPABASE_SERVICE_ROLE_KEY` 必须作为 secret 配置，不能提交到仓库。
+本服务不直接访问 Supabase，也不需要任何 Supabase secret。授权（权限 grant 与用量策略）在每次请求时委托给 `AUTH_USAGE_URL` 指向的 Dondone Auth usage 端点校验。
 
-`/echo` 只接受 ES256 `at+jwt`：header 必须有非空且匹配的 `kid`，`aud` 必须是单一字符串并精确等于 `AUTH_AUDIENCE`，scope 必须包含 `api:echo`，且 token 中每个 scope 都必须在当前 well-known manifest 的 `scopes_supported` 中。scope 只是请求能力上限；服务每次请求仍会读取 Supabase 当前 grant，撤销后立即拒绝。旧 `typ=JWT` token 会被拒绝。
+`/echo` 只接受 ES256 `at+jwt`：header 必须有非空且匹配的 `kid`，`aud` 必须是单一字符串并精确等于 `AUTH_AUDIENCE`，scope 必须包含 `api:echo`，且 token 中每个 scope 都必须在当前 well-known manifest 的 `scopes_supported` 中。scope 只是请求能力上限；服务每次请求仍会通过 usage 端点复检当前权限 grant，撤销后立即拒绝。旧 `typ=JWT` token 会被拒绝。
 
 公开的 `GET /.well-known/oauth-protected-resource` 是随服务版本发布的 RFC 9728 元数据。`scopes_supported` 只列 OAuth scope；`dondone_capabilities.permissions` 还可声明 `api:tier:vip` 这类实时策略权限，它不会写入 token scope。
-
-从 Supabase Dashboard 获取 service role key：
-
-1. 打开你的 Supabase project。
-2. 进入 **Project Settings** → **API Keys**。
-3. 在 API keys 列表中，复制具备 service role 权限的 secret key，通常以 `sb_secret_...` 开头。
-
-Supabase 默认可能会显示一个 `default` API key。不要把 publishable/default client key 用在这里；`dondone-api` 需要 service role secret key，因为它要在服务端读取授权表。
-
-使用 Wrangler 写入 service role key，然后粘贴从 Supabase 复制的值：
-
-```sh
-pnpm wrangler secret put SUPABASE_SERVICE_ROLE_KEY
-```
-
-也可以通过管道写入，例如：
-
-```sh
-echo "sb_secret_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" | pnpm wrangler secret put SUPABASE_SERVICE_ROLE_KEY
-```
 
 ## 开发
 

@@ -23,6 +23,16 @@ export interface CheckAndConsumeResponse {
   }>
 }
 
+// Only surface an upstream error identifier when it looks like a safe, bounded
+// error code (snake_case); otherwise fall back to a fixed local vocabulary so
+// arbitrary upstream text (internal identifiers, DB errors) never reaches the
+// client verbatim.
+function safeUpstreamError(value: unknown, fallback: string): string {
+  return typeof value === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(value)
+    ? value
+    : fallback
+}
+
 export function createUsageClient(env: WorkerEnv) {
   const baseUrl = env.AUTH_USAGE_URL
 
@@ -51,17 +61,13 @@ export function createUsageClient(env: WorkerEnv) {
     if (response.status === 400 || response.status === 422) {
       const body = (await response.json().catch(() => ({}))) as Record<string, unknown>
       const fallback = response.status === 422 ? 'service_mismatch' : 'invalid_request'
-      throw Object.assign(new Error(String(body.error ?? fallback)), {
-        status: response.status,
-        error: body.error ?? fallback,
-      })
+      const error = safeUpstreamError(body.error, fallback)
+      throw Object.assign(new Error(error), { status: response.status, error })
     }
     if (response.status === 403) {
       const body = (await response.json().catch(() => ({}))) as Record<string, unknown>
-      throw Object.assign(new Error(String(body.error ?? 'insufficient_scope')), {
-        status: 403,
-        error: body.error ?? 'insufficient_scope',
-      })
+      const error = safeUpstreamError(body.error, 'insufficient_scope')
+      throw Object.assign(new Error(error), { status: 403, error })
     }
     if (!response.ok) {
       throw Object.assign(new Error('authorization_unavailable'), {
